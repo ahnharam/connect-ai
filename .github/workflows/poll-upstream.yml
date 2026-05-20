@@ -1,0 +1,171 @@
+name: Poll Upstream
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_repository:
+        description: "Owner/repo for the external upstream repository"
+        required: false
+        default: "wonseokjung/connect-ai"
+      upstream_branch:
+        description: "Branch to poll from the upstream repository"
+        required: false
+        default: "main"
+      base_branch:
+        description: "Branch in this repository that receives sync PRs"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: poll-upstream-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    name: Poll external upstream
+    runs-on: ubuntu-latest
+
+    env:
+      DEFAULT_UPSTREAM_REPOSITORY: wonseokjung/connect-ai
+      DEFAULT_UPSTREAM_BRANCH: main
+      DEFAULT_BASE_BRANCH: main
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout fork repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve polling settings
+        id: settings
+        shell: bash
+        run: |
+          upstream_repository="${{ inputs.upstream_repository }}"
+          upstream_branch="${{ inputs.upstream_branch }}"
+          base_branch="${{ inputs.base_branch }}"
+
+          upstream_repository="${upstream_repository:-${{ vars.UPSTREAM_REPOSITORY }}}"
+          upstream_branch="${upstream_branch:-${{ vars.UPSTREAM_BRANCH }}}"
+          base_branch="${base_branch:-${{ vars.SYNC_BASE_BRANCH }}}"
+
+          upstream_repository="${upstream_repository:-$DEFAULT_UPSTREAM_REPOSITORY}"
+          upstream_branch="${upstream_branch:-$DEFAULT_UPSTREAM_BRANCH}"
+          base_branch="${base_branch:-$DEFAULT_BASE_BRANCH}"
+
+          {
+            echo "upstream_repository=$upstream_repository"
+            echo "upstream_branch=$upstream_branch"
+            echo "base_branch=$base_branch"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fetch base and upstream refs
+        shell: bash
+        run: |
+          git fetch origin "${{ steps.settings.outputs.base_branch }}"
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${{ steps.settings.outputs.upstream_repository }}.git"
+          git fetch upstream "${{ steps.settings.outputs.upstream_branch }}"
+
+      - name: Compare upstream with fork base
+        id: compare
+        shell: bash
+        run: |
+          base_ref="origin/${{ steps.settings.outputs.base_branch }}"
+          upstream_ref="upstream/${{ steps.settings.outputs.upstream_branch }}"
+          base_sha="$(git rev-parse "$base_ref")"
+          upstream_sha="$(git rev-parse "$upstream_ref")"
+          upstream_short="${upstream_sha:0:12}"
+          merge_base="$(git merge-base "$base_ref" "$upstream_ref")"
+
+          if [ "$base_sha" = "$upstream_sha" ] || [ "$merge_base" = "$upstream_sha" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Base already contains upstream $upstream_sha."
+            exit 0
+          fi
+
+          existing_pr="$(gh pr list --state open --search "$upstream_sha in:body" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing_pr" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Open sync PR #$existing_pr already tracks upstream $upstream_sha."
+            exit 0
+          fi
+
+          {
+            echo "changed=true"
+            echo "base_sha=$base_sha"
+            echo "upstream_sha=$upstream_sha"
+            echo "upstream_short=$upstream_short"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create sync branch
+        if: steps.compare.outputs.changed == 'true'
+        id: branch
+        shell: bash
+        run: |
+          timestamp="$(date -u +%Y%m%d-%H%M)"
+          branch="sync/upstream-${timestamp}-${{ steps.compare.outputs.upstream_short }}"
+          git checkout -B "$branch" "origin/${{ steps.settings.outputs.base_branch }}"
+          git merge --no-edit "upstream/${{ steps.settings.outputs.upstream_branch }}"
+          git push --set-upstream origin "$branch"
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Create sync pull request
+        if: steps.compare.outputs.changed == 'true'
+        shell: bash
+        run: |
+          base_sha="${{ steps.compare.outputs.base_sha }}"
+          upstream_sha="${{ steps.compare.outputs.upstream_sha }}"
+          upstream_short="${{ steps.compare.outputs.upstream_short }}"
+          upstream_repository="${{ steps.settings.outputs.upstream_repository }}"
+          upstream_branch="${{ steps.settings.outputs.upstream_branch }}"
+          base_branch="${{ steps.settings.outputs.base_branch }}"
+
+          files="$(git diff --name-only "$base_sha" "$upstream_sha" | sed 's/^/- /')"
+          commits="$(git log --oneline "$base_sha..$upstream_sha" | sed 's/^/- /')"
+          [ -n "$files" ] || files="- _No file list available._"
+          [ -n "$commits" ] || commits="- _No commit list available._"
+
+          body_file="$(mktemp)"
+          cat > "$body_file" <<EOF
+          ## Upstream sync
+
+          - Upstream repository: \`$upstream_repository\`
+          - Upstream branch: \`$upstream_branch\`
+          - Fork base branch: \`$base_branch\`
+          - Fork base SHA: \`$base_sha\`
+          - Upstream head SHA: \`$upstream_sha\`
+
+          ## Upstream commits
+
+          $commits
+
+          ## Changed files
+
+          $files
+
+          ## Migration note
+
+          This PR only syncs the fork tracking repository. Do not merge this directly into \`haram_project\`.
+          Use it as the source for a Haram migration intake PR and local Codex review.
+          EOF
+
+          gh label create upstream-sync --color 0969DA --description "Tracks external upstream changes" --force || true
+          gh pr create \
+            --base "$base_branch" \
+            --head "${{ steps.branch.outputs.name }}" \
+            --title "chore: sync upstream $upstream_short" \
+            --body-file "$body_file" \
+            --label upstream-sync
